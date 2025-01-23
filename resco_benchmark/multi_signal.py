@@ -2,16 +2,19 @@ import os
 import numpy as np
 import traci
 import sumolib
-import gym
+import gymnasium as gym
+from collections import defaultdict
 from resco_benchmark.traffic_signal import Signal
 
+from global_replay_buffer import GlobalReplayBuffer
+from junction_manager import JunctionManager
 
 class MultiSignal(gym.Env):
-    def __init__(self, run_name, map_name, net, state_fn, reward_fn, route=None, gui=False, end_time=3600,
+    def __init__(self, run_name, map_name, net, state_fn, reward_fn,degree=1, route=None, gui=False, end_time=3600,
                  step_length=10, yellow_length=4, step_ratio=1, max_distance=200, lights=(), log_dir='/', libsumo=False,
                  warmup=0, gymma=False):
         self.libsumo = libsumo
-        self.gymma = gymma  # gymma expects sequential list of states/rewards instead of dict
+        self.gymma = gymma
         print(map_name, net, state_fn.__name__, reward_fn.__name__)
         self.log_dir = log_dir
         self.net = net
@@ -21,6 +24,7 @@ class MultiSignal(gym.Env):
         self.reward_fn = reward_fn
         self.max_distance = max_distance
         self.warmup = warmup
+        self.degree = degree  # 共享范围
 
         self.end_time = end_time
         self.step_length = step_length
@@ -43,7 +47,7 @@ class MultiSignal(gym.Env):
             traci.start(sumo_cmd)
             self.sumo = traci
         else:
-            traci.start(sumo_cmd, label = self.connection_name)
+            traci.start(sumo_cmd, label=self.connection_name)
             self.sumo = traci.getConnection(self.connection_name)
         self.signal_ids = self.sumo.trafficlight.getIDList()
         print("lights", len(self.signal_ids), self.signal_ids)
@@ -57,7 +61,6 @@ class MultiSignal(gym.Env):
             ]
             for lightID in self.signal_ids
         }
-
 
         self.signals = dict()
 
@@ -91,19 +94,27 @@ class MultiSignal(gym.Env):
         self.metrics = []
         self.wait_metric = dict()
 
+        self.junction_manager = JunctionManager(self.sumo, self.degree)
+        self.global_buffer = GlobalReplayBuffer(self.junction_manager)
+        # 初始化路口索引
+        self.junctions = self.junction_manager.junctions
+        self.shared_junctions = self.junction_manager.shared_junctions
         if not self.libsumo: traci.switch(self.connection_name)
         traci.close()
         self.connection_name = run_name + '-' + map_name + '-' + str(len(lights)) + '-' + state_fn.__name__ + '-' + reward_fn.__name__
-        if not os.path.exists(log_dir+self.connection_name):
-            os.makedirs(log_dir+self.connection_name)
+        if not os.path.exists(log_dir + self.connection_name):
+            os.makedirs(log_dir + self.connection_name)
         self.sumo_cmd = None
         print('Connection ID', self.connection_name)
+
+
+
 
     def step_sim(self):
         # The monaco scenario expects .25s steps instead of 1s, account for that here.
         for _ in range(self.step_ratio):
             self.sumo.simulationStep()
-        
+
     def reset(self):
         if self.run != 0:
             if not self.libsumo: traci.switch(self.connection_name)
@@ -121,7 +132,7 @@ class MultiSignal(gym.Env):
         else:
             self.sumo_cmd.append(sumolib.checkBinary('sumo'))
         if self.route is not None:
-            self.sumo_cmd += ['-n', self.net, '-r', self.route + '_'+str(self.run)+'.rou.xml']
+            self.sumo_cmd += ['-n', self.net, '-r', self.route + '_' + str(self.run) + '.rou.xml']
         else:
             self.sumo_cmd += ['-c', self.net]
         self.sumo_cmd += ['--random', '--time-to-teleport', '-1', '--tripinfo-output',
@@ -168,7 +179,10 @@ class MultiSignal(gym.Env):
                 dict_act[ts] = act[i]
             act = dict_act
 
-        # Send actions to their signals
+        # 获取当前车流量信息
+        traffic_info = self._get_traffic_info()
+
+        # 发送动作到信号灯
         for signal in self.signals:
             self.signals[signal].prep_phase(act[signal])
 
@@ -181,9 +195,20 @@ class MultiSignal(gym.Env):
         for signal in self.signal_ids:
             self.signals[signal].observe(self.step_length, self.max_distance)
 
-        # observe new state and reward
+        # 观察新状态和奖励
         observations = self.state_fn(self.signals)
         rewards = self.reward_fn(self.signals)
+
+        # 将经验添加到全局缓冲区
+        for signal_id in self.signals:
+            experience = {
+                'observation': observations[signal_id],
+                'action': act[signal_id],
+                'reward': rewards[signal_id],
+                'next_observation': observations[signal_id],  # 假设下一个状态与当前状态相同
+                'done': False
+            }
+            self.global_buffer.append(experience, signal_id)  # 使用 GlobalReplayBuffer 添加经验
 
         self.calc_metrics(rewards)
 
@@ -195,6 +220,18 @@ class MultiSignal(gym.Env):
                 rww.append(rewards[ts])
             return obss, rww, [done], {'eps': self.run}
         return observations, rewards, done, {'eps': self.run}
+
+    def _get_traffic_info(self):
+        """获取当前车流量信息"""
+        traffic_info = {}
+        for signal_id in self.signals:
+            lanes = self.signals[signal_id].lanes
+            queue_lengths = [self.sumo.lane.getLastStepHaltingNumber(lane) for lane in lanes]
+            traffic_info[signal_id] = {
+                'queue_lengths': queue_lengths,
+                'total_queue': sum(queue_lengths)
+            }
+        return traffic_info
 
     def calc_metrics(self, rewards):
         queue_lengths = dict()
@@ -216,7 +253,7 @@ class MultiSignal(gym.Env):
         })
 
     def save_metrics(self):
-        log = os.path.join(self.log_dir, self.connection_name+ os.sep + 'metrics_' + str(self.run) + '.csv')
+        log = os.path.join(self.log_dir, self.connection_name + os.sep + 'metrics_' + str(self.run) + '.csv')
         print('saving', log)
         with open(log, 'w+') as output_file:
             for line in self.metrics:
